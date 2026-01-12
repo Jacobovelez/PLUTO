@@ -16,6 +16,10 @@ from pluto_engine import (
     completion_probability,
     get_best_model_for_complexity,
     evaluate_student_choice,
+    fit_duration_linear_models,
+    predict_duration,
+    optimize_allocation,
+    success_score,
 )
 
 st.set_page_config(page_title="PLUTO – Duration (mois)", layout="wide")
@@ -265,50 +269,96 @@ else:
     st.warning("Pas assez de données pour tracer les modèles.")
 
 st.divider()
-st.header("Étape 5 — Prediction test (par complexité)")
+st.header("Étape 5 — Simulateur 'What-if' (curseurs) + solution optimale PLUTO")
 
 st.caption(
-    "On choisit une complexité et une durée cible. "
-    "On calcule la probabilité de terminer avant la cible selon : "
-    "1) un modèle Gaussien, 2) le modèle optimal sélectionné (AIC)."
+    "Ici, on simule l’impact des leviers (effort, coût, révisions) sur la durée. "
+    "L’objectif est pédagogique : tester des scénarios et comparer à une solution optimale calculée par PLUTO "
+    "(minimisation de la durée sous contraintes)."
 )
 
-# On réutilise fit_tbl et best_aic déjà calculés à l'étape 4
+# 1) On entraîne des modèles linéaires par complexité (sur la base nettoyée)
+models = fit_duration_linear_models(work_df, group="complexity")
+
 complexities = sorted(work_df["complexity"].unique().tolist())
-comp_pred = st.selectbox("Complexité du projet", complexities, key="comp_pred")
+comp = st.selectbox("Complexité", complexities, key="step5_comp")
 
-target = st.number_input("Durée cible (mois)", min_value=1.0, value=24.0, step=1.0)
+if comp not in models:
+    st.warning("Pas assez de données pour ajuster un modèle what-if sur cette complexité.")
+    st.stop()
 
-# --- récupérer paramètres du modèle optimal
-best_model, best_params = get_best_model_for_complexity(best_bic, comp_pred)
+model = models[comp]
 
-# --- récupérer aussi params du normal (depuis fit_tbl)
-row_norm = fit_tbl[(fit_tbl["complexity"] == comp_pred) & (fit_tbl["model"] == "normal")]
-norm_params = None if row_norm.empty else row_norm.iloc[0]["params"]
+# 2) Définir une zone 'standard' (bornes par défaut) à partir des quantiles
+sub = work_df[work_df["complexity"] == comp].dropna(subset=["effort_my","cost_keur","revisions_number","duration_months"])
+q = sub[["effort_my","cost_keur","revisions_number","duration_months"]].quantile([0.1, 0.5, 0.9])
 
-p_best = completion_probability(best_model, best_params, target)
-p_norm = completion_probability("normal", norm_params, target)
+eff_std = float(q.loc[0.5,"effort_my"])
+cost_std = float(q.loc[0.5,"cost_keur"])
+rev_std = float(q.loc[0.5,"revisions_number"])
 
-c1, c2 = st.columns(2)
+st.subheader("Choix des curseurs (scénario étudiant)")
+c1, c2, c3 = st.columns(3)
+
 with c1:
-    st.subheader("Modèle Gaussien")
-    if p_norm is None:
-        st.warning("Impossible de calculer la probabilité (normal).")
-    else:
-        st.metric("P(Duration ≤ cible)", f"{100*p_norm:.1f}%")
-
+    effort = st.slider("Effort (unités)", float(q.loc[0.1,"effort_my"]), float(q.loc[0.9,"effort_my"]), eff_std, step=0.5)
 with c2:
-    st.subheader("Modèle optimal (AIC)")
-    st.write(f"Modèle sélectionné : **{best_model}**")
-    if p_best is None:
-        st.warning("Impossible de calculer la probabilité (modèle optimal).")
-    else:
-        st.metric("P(Duration ≤ cible)", f"{100*p_best:.1f}%")
+    cost = st.slider("Coût (k€)", float(q.loc[0.1,"cost_keur"]), float(q.loc[0.9,"cost_keur"]), cost_std, step=50.0)
+with c3:
+    revisions = st.slider("Nb de révisions", int(q.loc[0.1,"revisions_number"]), int(q.loc[0.9,"revisions_number"]), int(rev_std), step=1)
 
-# message pédagogique
-if (p_norm is not None) and (p_best is not None):
-    delta = (p_best - p_norm) * 100
-    st.info(
-        f"Différence (optimal - gaussien) : **{delta:.1f} points**. "
-        "Si la distribution n’est pas normale, le modèle optimal donne souvent une estimation plus réaliste."
-    )
+student_duration = predict_duration(model, effort, cost, revisions)
+
+st.markdown("### Résultat étudiant")
+st.metric("Durée prédite (mois)", f"{student_duration:.1f}")
+
+# 3) Contraintes pour l'optimisation PLUTO (l'étudiant peut les fixer)
+st.subheader("Contraintes pour l’optimisation PLUTO")
+st.caption("PLUTO cherche la meilleure combinaison (effort, coût, révisions) qui minimise la durée prédite, sous contraintes.")
+
+colA, colB, colC = st.columns(3)
+with colA:
+    effort_max = st.slider("Effort max", float(q.loc[0.5,"effort_my"]), float(q.loc[0.9,"effort_my"]), float(q.loc[0.9,"effort_my"]), step=0.5)
+with colB:
+    cost_max = st.slider("Budget max (k€)", float(q.loc[0.5,"cost_keur"]), float(q.loc[0.9,"cost_keur"]), float(q.loc[0.9,"cost_keur"]), step=50.0)
+with colC:
+    rev_max = st.slider("Révisions max", int(q.loc[0.5,"revisions_number"]), int(q.loc[0.9,"revisions_number"]), int(q.loc[0.9,"revisions_number"]), step=1)
+
+opt = optimize_allocation(
+    model,
+    effort_range=(float(q.loc[0.1,"effort_my"]), effort_max),
+    cost_range=(float(q.loc[0.1,"cost_keur"]), cost_max),
+    rev_range=(int(q.loc[0.1,"revisions_number"]), rev_max),
+    step_effort=0.5,
+    step_cost=50.0,
+    step_rev=1
+)
+
+st.markdown("### Solution optimale PLUTO (min durée sous contraintes)")
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("Effort optimal", f"{opt['effort_my']:.1f}")
+with c2:
+    st.metric("Coût optimal (k€)", f"{opt['cost_keur']:.0f}")
+with c3:
+    st.metric("Révisions optimales", f"{opt['revisions_number']}")
+with c4:
+    st.metric("Durée optimale (mois)", f"{opt['duration_pred']:.1f}")
+
+# 4) Score de succès
+score = success_score(student_duration, opt["duration_pred"])
+st.subheader("Pourcentage de succès")
+st.metric("Score (0–100)", f"{score:.1f}%")
+
+# 5) Explication claire
+st.info(
+    "Interprétation :\n"
+    "- Ta durée prédite dépend des curseurs (effort, coût, révisions).\n"
+    "- PLUTO calcule ensuite la combinaison qui minimise la durée, tout en respectant les contraintes.\n"
+    "- Le score mesure à quel point ton scénario est proche de la performance optimale (en durée)."
+)
+
+st.caption(
+    "Note méthodologique : ce simulateur est un outil pédagogique 'what-if' basé sur les tendances observées "
+    "dans l'historique. Il ne prouve pas une causalité parfaite, mais permet de raisonner sur des compromis."
+)

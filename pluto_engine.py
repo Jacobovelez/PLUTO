@@ -1,6 +1,10 @@
+from dataclasses import dataclass
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+
 
 def clean_projects_with_log(raw: pd.DataFrame):
     """Nettoyage + transparence:
@@ -137,34 +141,40 @@ def kpis_by_complexity(df: pd.DataFrame, var: str, group: str):
     out = df.groupby(group)[var].apply(lambda x: _agg(x.dropna())).reset_index()
     return out.round(3)
 
-
 def plot_histograms(df: pd.DataFrame, var: str, group: str):
+    # On affiche d'abord les complexités, puis le global en dernier
     groups = sorted(df[group].dropna().unique().tolist())
-    n = len(groups)
-    ncols = 2
-    nrows = int(np.ceil((n + 1) / ncols))
 
-    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10, 4 * nrows))
+    # +1 pour le graphique global
+    n_plots = len(groups) + 1
+    ncols = 2
+    nrows = int(np.ceil(n_plots / ncols))
+
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12, 4 * nrows))
     axes = np.array(axes).reshape(-1)
 
-    axes[0].hist(df[var].dropna(), bins=25)
-    axes[0].set_title("Global")
-    axes[0].set_xlabel(var)
-    axes[0].set_ylabel("Count")
-
-    for i, g in enumerate(groups, start=1):
-        ax = axes[i]
+    # 1) Histogrammes par complexité
+    for i, g in enumerate(groups):
         sub = df.loc[df[group] == g, var].dropna()
-        ax.hist(sub, bins=20)
-        ax.set_title(str(g))
-        ax.set_xlabel(var)
-        ax.set_ylabel("Count")
+        axes[i].hist(sub, bins=20)
+        axes[i].set_title(g)
+        axes[i].set_xlabel(var)
+        axes[i].set_ylabel("Count")
 
-    for j in range(n + 1, len(axes)):
+    # 2) Histogramme global (dernier)
+    idx_global = len(groups)
+    axes[idx_global].hist(df[var].dropna(), bins=20)
+    axes[idx_global].set_title("Global")
+    axes[idx_global].set_xlabel(var)
+    axes[idx_global].set_ylabel("Count")
+
+    # Masquer les axes inutilisés
+    for j in range(idx_global + 1, len(axes)):
         axes[j].axis("off")
 
     fig.tight_layout()
     return fig
+
 def plot_boxplot_by_complexity(df: pd.DataFrame, var: str, group: str):
     """Boxplot de var par groupe (complexity)."""
     work = df[[group, var]].dropna().copy()
@@ -526,3 +536,96 @@ def evaluate_student_choice(fit_table: pd.DataFrame, complexity_value: str, chos
         "delta": delta,
         "extra": extra,
     }
+
+@dataclass
+class DurationModel:
+    intercept: float
+    coef_effort: float
+    coef_cost: float
+    coef_revisions: float
+
+def fit_duration_linear_models(df: pd.DataFrame, group: str = "complexity") -> dict:
+    """
+    Ajuste un modèle linéaire simple:
+      duration_months ≈ a + b1*effort_my + b2*cost_keur + b3*revisions_number
+    par complexité. (Modèle "what-if", pédagogique)
+    """
+    required = ["duration_months", "effort_my", "cost_keur", "revisions_number", group]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Colonnes manquantes pour l'étape 5: {missing}")
+
+    models = {}
+    for comp, sub in df.groupby(group):
+        sub = sub.dropna(subset=["duration_months", "effort_my", "cost_keur", "revisions_number"])
+        if len(sub) < 8:
+            continue
+
+        y = sub["duration_months"].values.astype(float)
+        X = np.column_stack([
+            np.ones(len(sub)),
+            sub["effort_my"].values.astype(float),
+            sub["cost_keur"].values.astype(float),
+            sub["revisions_number"].values.astype(float),
+        ])
+
+        # Moindres carrés (rapide, sans dépendance)
+        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+
+        models[comp] = DurationModel(
+            intercept=float(beta[0]),
+            coef_effort=float(beta[1]),
+            coef_cost=float(beta[2]),
+            coef_revisions=float(beta[3]),
+        )
+
+    return models
+
+
+def predict_duration(model: DurationModel, effort_my: float, cost_keur: float, revisions_number: float) -> float:
+    """Prédiction durée (mois) via modèle linéaire."""
+    pred = (
+        model.intercept
+        + model.coef_effort * effort_my
+        + model.coef_cost * cost_keur
+        + model.coef_revisions * revisions_number
+    )
+    return float(max(pred, 1.0))  # durée min 1 mois
+
+
+def optimize_allocation(model: DurationModel,
+                        effort_range: tuple,
+                        cost_range: tuple,
+                        rev_range: tuple,
+                        step_effort: float = 0.5,
+                        step_cost: float = 50.0,
+                        step_rev: int = 1) -> dict:
+    """
+    Cherche la meilleure combinaison (effort, cost, revisions) qui minimise la durée prédite,
+    par recherche grille (suffisant et lisible pour un outil formatif).
+    """
+    e_min, e_max = effort_range
+    c_min, c_max = cost_range
+    r_min, r_max = rev_range
+
+    best = None
+    for e in np.arange(e_min, e_max + 1e-9, step_effort):
+        for c in np.arange(c_min, c_max + 1e-9, step_cost):
+            for r in range(int(r_min), int(r_max) + 1, int(step_rev)):
+                d = predict_duration(model, e, c, r)
+                if (best is None) or (d < best["duration_pred"]):
+                    best = {"effort_my": float(e), "cost_keur": float(c), "revisions_number": int(r), "duration_pred": float(d)}
+
+    return best
+
+
+def success_score(student_duration: float, optimal_duration: float) -> float:
+    """
+    Score 0–100 basé sur la proximité à l'optimum (durée).
+    100 si égal à l'optimum, puis décroît avec l'écart relatif.
+    """
+    if optimal_duration <= 0:
+        return 0.0
+    err_rel = abs(student_duration - optimal_duration) / optimal_duration
+    score = 100.0 * max(0.0, 1.0 - err_rel)
+    return round(score, 1)
